@@ -1,0 +1,3 @@
+/wgtunnel
+*.conf
+!wg.example.conf
