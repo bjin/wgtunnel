@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/device"
@@ -33,6 +34,7 @@ func (s *stringSlice) Set(value string) error {
 }
 
 type TunnelConfig struct {
+	Protocol    string // "tcp" or "udp"
 	BindIP      string
 	BindPort    int
 	ForwardAddr string
@@ -43,15 +45,16 @@ func main() {
 		configFile = flag.String("config", "wg.conf", "Path to WireGuard configuration file")
 		localIP    = flag.String("local", "", "Local tunnel IP (e.g., 10.0.0.2)")
 		mtu        = flag.Int("mtu", 1408, "MTU for wireguard device")
+		udpTimeout = flag.Duration("udp-timeout", 3*time.Minute, "UDP session idle timeout (default: 3m)")
 		lFlags     stringSlice
 		rFlags     stringSlice
 	)
-	flag.Var(&lFlags, "L", "Local forward: [ip:]port:dest:dport (listen on host, forward to wireguard)")
-	flag.Var(&rFlags, "R", "Remote forward: port:dest:dport (listen on wireguard, forward to host)")
+	flag.Var(&lFlags, "L", "Local forward: [ip:]port:dest:dport[:tcp|udp] (listen on host, forward to wg)")
+	flag.Var(&rFlags, "R", "Remote forward: port:dest:dport[:tcp|udp] (listen on wg, forward to host)")
 	flag.Parse()
 
 	if *localIP == "" || (len(lFlags) == 0 && len(rFlags) == 0) {
-		fmt.Println("Usage: wgtunnel --local <ip> [-L [ip:]port:dest:dport]... [-R port:dest:dport]...")
+		fmt.Println("Usage: wgtunnel --local <ip> [-L [ip:]port:dest:dport[:tcp|udp]]... [-R port:dest:dport[:tcp|udp]]...")
 		flag.PrintDefaults()
 		os.Exit(1)
 	}
@@ -104,32 +107,57 @@ func main() {
 	// Setup -L listeners (Local Host -> WireGuard)
 	for _, c := range lConfigs {
 		addr := net.JoinHostPort(c.BindIP, strconv.Itoa(c.BindPort))
-		l, err := net.Listen("tcp", addr)
-		if err != nil {
-			log.Fatalf("Failed to listen on host address %s: %v", addr, err)
+		if c.Protocol == "tcp" {
+			l, err := net.Listen("tcp", addr)
+			if err != nil {
+				log.Fatalf("Failed to listen TCP on host address %s: %v", addr, err)
+			}
+			listeners = append(listeners, l)
+			wg.Add(1)
+			go runTCPListener(ctx, &wg, l, c.ForwardAddr, tnet.Dial, "Local")
+		} else {
+			udpAddr, err := net.ResolveUDPAddr("udp", addr)
+			if err != nil {
+				log.Fatalf("Failed to resolve UDP host address %s: %v", addr, err)
+			}
+			l, err := net.ListenUDP("udp", udpAddr)
+			if err != nil {
+				log.Fatalf("Failed to listen UDP on host address %s: %v", addr, err)
+			}
+			listeners = append(listeners, l)
+			wg.Add(1)
+			go runUDPListener(ctx, &wg, l, c.ForwardAddr, tnet.Dial, "Local", *udpTimeout)
 		}
-		listeners = append(listeners, l)
-		wg.Add(1)
-		go runListener(ctx, &wg, l, c.ForwardAddr, tnet.Dial, "Local")
 	}
 
 	// Setup -R listeners (WireGuard -> Local Host)
 	listenNetIP := net.ParseIP(*localIP)
 	for _, c := range rConfigs {
-		addr := &net.TCPAddr{IP: listenNetIP, Port: c.BindPort}
-		l, err := tnet.ListenTCP(addr)
-		if err != nil {
-			log.Fatalf("Failed to listen on wireguard address %s: %v", addr, err)
+		if c.Protocol == "tcp" {
+			addr := &net.TCPAddr{IP: listenNetIP, Port: c.BindPort}
+			l, err := tnet.ListenTCP(addr)
+			if err != nil {
+				log.Fatalf("Failed to listen TCP on wireguard address %s: %v", addr, err)
+			}
+			listeners = append(listeners, l)
+			wg.Add(1)
+			go runTCPListener(ctx, &wg, l, c.ForwardAddr, net.Dial, "Remote")
+		} else {
+			addr := &net.UDPAddr{IP: listenNetIP, Port: c.BindPort}
+			l, err := tnet.ListenUDP(addr)
+			if err != nil {
+				log.Fatalf("Failed to listen UDP on wireguard address %s: %v", addr, err)
+			}
+			listeners = append(listeners, l)
+			wg.Add(1)
+			go runUDPListener(ctx, &wg, l, c.ForwardAddr, net.Dial, "Remote", *udpTimeout)
 		}
-		listeners = append(listeners, l)
-		wg.Add(1)
-		go runListener(ctx, &wg, l, c.ForwardAddr, net.Dial, "Remote")
 	}
 
 	// 3. Graceful Shutdown handler
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
-	
+
 	log.Printf("All tunnels established successfully. Press Ctrl+C to stop.")
 	<-sigs
 	log.Println("\nShutting down listeners...")
@@ -144,47 +172,41 @@ func main() {
 	log.Println("Graceful shutdown complete.")
 }
 
-// runListener loops and accepts incoming connections
-func runListener(ctx context.Context, wg *sync.WaitGroup, listener net.Listener, forwardAddr string, dialFunc func(network, addr string) (net.Conn, error), typ string) {
+// --- TCP Logic ---
+
+func runTCPListener(ctx context.Context, wg *sync.WaitGroup, listener net.Listener, forwardAddr string, dialFunc func(network, addr string) (net.Conn, error), typ string) {
 	defer wg.Done()
-	log.Printf("[%s] Listening on %s, forwarding to %s", typ, listener.Addr(), forwardAddr)
+	log.Printf("[%s TCP] Listening on %s, forwarding to %s", typ, listener.Addr(), forwardAddr)
 
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			// Check if we are intentionally shutting down
 			select {
 			case <-ctx.Done():
-				// Context was canceled, so we expect Accept to fail. Exit cleanly.
-				return
+				return // Context was canceled, exit cleanly.
 			default:
-				// If context isn't canceled, it's a real error. Log and retry.
-				log.Printf("[%s] Accept error: %v", typ, err)
+				log.Printf("[%s TCP] Accept error: %v", typ, err)
 				continue
 			}
 		}
-		go handleConnection(conn, forwardAddr, dialFunc)
+		go handleTCPConnection(conn, forwardAddr, dialFunc)
 	}
 }
 
-// handleConnection handles bidirectional data forwarding cleanly
-func handleConnection(inConn net.Conn, forwardAddr string, dialFunc func(network, addr string) (net.Conn, error)) {
+func handleTCPConnection(inConn net.Conn, forwardAddr string, dialFunc func(network, addr string) (net.Conn, error)) {
 	defer inConn.Close()
 
 	outConn, err := dialFunc("tcp", forwardAddr)
 	if err != nil {
-		log.Printf("Failed to dial forward address %s: %v", forwardAddr, err)
+		log.Printf("Failed to dial TCP forward address %s: %v", forwardAddr, err)
 		return
 	}
 	defer outConn.Close()
 
-	// Channel to signal when one side of the copy finishes
 	errc := make(chan error, 2)
 
 	copyConn := func(dst, src net.Conn) {
 		_, err := io.Copy(dst, src)
-		// Best practice: if the destination connection supports half-close, close the write end.
-		// This propagates the EOF to the underlying application.
 		if cw, ok := dst.(interface{ CloseWrite() error }); ok {
 			cw.CloseWrite()
 		}
@@ -194,30 +216,104 @@ func handleConnection(inConn net.Conn, forwardAddr string, dialFunc func(network
 	go copyConn(outConn, inConn)
 	go copyConn(inConn, outConn)
 
-	// Block until the first copy routine finishes (e.g. client disconnects or network error)
-	// Returning causes the defers to fire, cleanly terminating the other direction.
 	<-errc
 }
 
-// parseForwards parses -L and -R string formats and validates port uniqueness
+// --- UDP Logic ---
+
+func runUDPListener(ctx context.Context, wg *sync.WaitGroup, listener net.PacketConn, forwardAddr string, dialFunc func(network, addr string) (net.Conn, error), typ string, timeout time.Duration) {
+	defer wg.Done()
+	log.Printf("[%s UDP] Listening on %s, forwarding to %s", typ, listener.LocalAddr(), forwardAddr)
+
+	var mu sync.Mutex
+	sessions := make(map[string]net.Conn)
+	buf := make([]byte, 65535)
+
+	for {
+		n, clientAddr, err := listener.ReadFrom(buf)
+		if err != nil {
+			select {
+			case <-ctx.Done():
+				return // Context was canceled, exit cleanly.
+			default:
+				log.Printf("[%s UDP] ReadFrom error: %v", typ, err)
+				continue
+			}
+		}
+
+		clientKey := clientAddr.String()
+
+		mu.Lock()
+		outConn, exists := sessions[clientKey]
+		if !exists {
+			outConn, err = dialFunc("udp", forwardAddr)
+			if err != nil {
+				log.Printf("[%s UDP] Failed to dial %s: %v", typ, forwardAddr, err)
+				mu.Unlock()
+				continue
+			}
+			sessions[clientKey] = outConn
+
+			go func(c net.Conn, cAddr net.Addr, key string) {
+				defer c.Close()
+				defer func() {
+					mu.Lock()
+					if existing, ok := sessions[key]; ok && existing == c {
+						delete(sessions, key)
+					}
+					mu.Unlock()
+				}()
+
+				respBuf := make([]byte, 65535)
+				for {
+					c.SetReadDeadline(time.Now().Add(timeout))
+					rn, rerr := c.Read(respBuf)
+					if rerr != nil {
+						return // Timeout or connection closed
+					}
+					listener.WriteTo(respBuf[:rn], cAddr)
+				}
+			}(outConn, clientAddr, clientKey)
+		}
+		mu.Unlock()
+
+		// Send inbound packet to the forwarded destination
+		outConn.Write(buf[:n])
+	}
+}
+
+// --- Parser ---
+
 func parseForwards(flags []string, isRemote bool) ([]TunnelConfig, error) {
 	var configs []TunnelConfig
 	usedPorts := make(map[string]bool)
 
 	for _, f := range flags {
 		parts := strings.Split(f, ":")
+		if len(parts) < 3 {
+			return nil, fmt.Errorf("invalid format '%s'", f)
+		}
+
+		// Check for optional :tcp or :udp suffix
+		proto := "tcp"
+		last := strings.ToLower(parts[len(parts)-1])
+		if last == "tcp" || last == "udp" {
+			proto = last
+			parts = parts[:len(parts)-1]
+		}
+
 		var ip, portStr, dest, dport string
 
 		if isRemote {
 			if len(parts) != 3 {
-				return nil, fmt.Errorf("invalid -R format '%s', expected port:dest:dport", f)
+				return nil, fmt.Errorf("invalid -R format '%s', expected port:dest:dport[:tcp|udp]", f)
 			}
 			portStr = parts[0]
 			dest = parts[1]
 			dport = parts[2]
 		} else {
 			if len(parts) == 3 {
-				ip = "0.0.0.0" // Default bind IP
+				ip = "0.0.0.0"
 				portStr = parts[0]
 				dest = parts[1]
 				dport = parts[2]
@@ -227,18 +323,20 @@ func parseForwards(flags []string, isRemote bool) ([]TunnelConfig, error) {
 				dest = parts[2]
 				dport = parts[3]
 			} else {
-				return nil, fmt.Errorf("invalid -L format '%s', expected [ip:]port:dest:dport", f)
+				return nil, fmt.Errorf("invalid -L format '%s', expected [ip:]port:dest:dport[:tcp|udp]", f)
 			}
 		}
 
-		if usedPorts[portStr] {
+		// Combine protocol and port to allow binding the same port for TCP and UDP
+		portKey := proto + ":" + portStr
+		if usedPorts[portKey] {
 			flagType := "-L"
 			if isRemote {
 				flagType = "-R"
 			}
-			return nil, fmt.Errorf("duplicate port '%s' found in %s flags", portStr, flagType)
+			return nil, fmt.Errorf("duplicate port '%s' for protocol '%s' found in %s flags", portStr, proto, flagType)
 		}
-		usedPorts[portStr] = true
+		usedPorts[portKey] = true
 
 		port, err := strconv.Atoi(portStr)
 		if err != nil || port <= 0 || port > 65535 {
@@ -250,7 +348,8 @@ func parseForwards(flags []string, isRemote bool) ([]TunnelConfig, error) {
 		}
 
 		configs = append(configs, TunnelConfig{
-			BindIP:      ip, // Empty for -R, to be filled via net.TCPAddr mapping
+			Protocol:    proto,
+			BindIP:      ip,
 			BindPort:    port,
 			ForwardAddr: net.JoinHostPort(dest, dport),
 		})
