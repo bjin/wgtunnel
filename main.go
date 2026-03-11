@@ -96,6 +96,7 @@ func main() {
 	if err := dev.Up(); err != nil {
 		log.Fatalf("Failed to bring device up: %v", err)
 	}
+	defer dev.Close()
 
 	// 2. Setup Listeners
 	var wg sync.WaitGroup
@@ -217,6 +218,7 @@ func handleTCPConnection(inConn net.Conn, forwardAddr string, dialFunc func(netw
 	go copyConn(inConn, outConn)
 
 	<-errc
+	<-errc
 }
 
 // --- UDP Logic ---
@@ -277,8 +279,11 @@ func runUDPListener(ctx context.Context, wg *sync.WaitGroup, listener net.Packet
 		}
 		mu.Unlock()
 
-		// Send inbound packet to the forwarded destination
-		outConn.Write(buf[:n])
+		// Send inbound packet to the forwarded destination.
+		// Copy buf before writing so the next ReadFrom doesn't race with Write.
+		pkt := make([]byte, n)
+		copy(pkt, buf[:n])
+		outConn.Write(pkt)
 	}
 }
 
