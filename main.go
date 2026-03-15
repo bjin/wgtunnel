@@ -167,7 +167,9 @@ func main() {
 	cancel()
 
 	for _, l := range listeners {
-		l.Close()
+		if err := l.Close(); err != nil {
+			log.Printf("Warning: failed to close listener: %v", err)
+		}
 	}
 	wg.Wait()
 	log.Println("Graceful shutdown complete.")
@@ -190,11 +192,11 @@ func runTCPListener(ctx context.Context, wg *sync.WaitGroup, listener net.Listen
 				continue
 			}
 		}
-		go handleTCPConnection(conn, forwardAddr, dialFunc)
+		go handleTCPConnection(ctx, conn, forwardAddr, dialFunc)
 	}
 }
 
-func handleTCPConnection(inConn net.Conn, forwardAddr string, dialFunc func(network, addr string) (net.Conn, error)) {
+func handleTCPConnection(ctx context.Context, inConn net.Conn, forwardAddr string, dialFunc func(network, addr string) (net.Conn, error)) {
 	defer inConn.Close()
 
 	outConn, err := dialFunc("tcp", forwardAddr)
@@ -203,6 +205,18 @@ func handleTCPConnection(inConn net.Conn, forwardAddr string, dialFunc func(netw
 		return
 	}
 	defer outConn.Close()
+
+	// Unblock any stalled io.Copy when the context is canceled (e.g. shutdown)
+	// by setting an immediate deadline on both connections. Avoids double-close
+	// since inConn and outConn are already closed by their defers above.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() {
+		<-ctx.Done()
+		now := time.Now()
+		inConn.SetDeadline(now)
+		outConn.SetDeadline(now)
+	}()
 
 	errc := make(chan error, 2)
 
