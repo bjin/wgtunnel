@@ -1,0 +1,48 @@
+version: '3.8'
+
+services:
+  wg-server:
+    build:
+      context: .
+      network: host
+      dockerfile_inline: |
+        FROM golang:1.23 AS builder
+        RUN git clone https://github.com/WireGuard/wireguard-go.git /app
+        WORKDIR /app
+        RUN CGO_ENABLED=0 make
+
+        FROM alpine:latest
+        RUN apk add --no-cache iproute2 wireguard-tools socat bash
+        
+        COPY --from=builder /app/wireguard-go /usr/bin/wireguard-go
+
+        RUN cat <<'EOF' > /entrypoint.sh
+        #!/bin/bash
+        set -e
+        mkdir -p /etc/wireguard /var/run/wireguard
+        wg genkey | tee /etc/wireguard/server_priv | wg pubkey > /etc/wireguard/server_pub
+        wg genkey | tee /etc/wireguard/client_priv | wg pubkey > /etc/wireguard/client_pub
+
+        wireguard-go wg0
+        wg set wg0 private-key /etc/wireguard/server_priv listen-port 51820 peer "$(cat /etc/wireguard/client_pub)" allowed-ips 10.1.1.2/32
+        ip address add 10.1.1.1/24 dev wg0
+        ip link set wg0 up
+
+        echo "ready"
+        exec sleep infinity
+        EOF
+        RUN chmod +x /entrypoint.sh
+
+        ENTRYPOINT ["/entrypoint.sh"]
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun
+    ports:
+      - "51820:51820/udp"
+    networks:
+      - wg-net
+
+networks:
+  wg-net:
+    internal: false
