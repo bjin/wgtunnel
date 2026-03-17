@@ -264,7 +264,7 @@ func startUDPForwarder(ctx context.Context, wg *sync.WaitGroup, listener net.Pac
 				continue
 			}
 			// Buffered so the main loop is never blocked by a slow session.
-			sendChan = make(chan []byte, 32)
+			sendChan = make(chan []byte, 1024)
 			sessions[clientKey] = sendChan
 
 			go func(conn net.Conn, cAddr net.Addr, key string, ch chan []byte) {

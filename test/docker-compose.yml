@@ -12,7 +12,7 @@ services:
         RUN CGO_ENABLED=0 make
 
         FROM alpine:latest
-        RUN apk add --no-cache iproute2 wireguard-tools socat bash
+        RUN apk add --no-cache iproute2 wireguard-tools socat bash iperf3
         
         COPY --from=builder /app/wireguard-go /usr/bin/wireguard-go
 

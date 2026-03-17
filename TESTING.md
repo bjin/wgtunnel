@@ -9,6 +9,7 @@ Ensure you have the following installed on your host system:
 *   **Make** (to build `wgtunnel`)
 *   **Python 3.x**
 *   **pytest** (`pip install pytest`)
+*   **iperf3** (for benchmarking)
 
 ## Running the Integration Tests
 
@@ -36,3 +37,21 @@ pytest -v
 
 3.  **Teardown Phase**:
     *   Automatically cleans up temporary config files and tears down the Docker compose environment (`docker compose down -v`).
+
+## Benchmarking
+
+A Python script `benchmark.py` is included to test the throughput capabilities of `wgtunnel`. It uses `iperf3` to measure both TCP and UDP speeds for both Local (`-L`) and Remote (`-R`) port forwarding directions.
+
+To run the benchmark:
+
+```bash
+cd test
+python benchmark.py
+```
+
+The script performs the following tasks:
+1.  Spins up the same Docker Compose environment as the integration tests.
+2.  Runs `iperf3` in server mode (either on the host or inside the container depending on the test direction).
+3.  Measures TCP upload and download throughput.
+4.  Uses the TCP baseline to set a stable target for UDP throughput tests, and calculates the effective UDP bandwidth factoring in packet loss.
+5.  Prints a formatted table summarizing the results in Mbps.
