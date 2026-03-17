@@ -190,14 +190,14 @@ func startTCPForwarder(ctx context.Context, wg *sync.WaitGroup, listener net.Lis
 }
 
 func handleTCPConnection(ctx context.Context, clientConn net.Conn, targetAddr string, dialer func(string, string) (net.Conn, error)) {
-	defer clientConn.Close()
+	defer func() { _ = clientConn.Close() }()
 
 	targetConn, err := dialer("tcp", targetAddr)
 	if err != nil {
 		log.Printf("Failed to dial target %s: %v", targetAddr, err)
 		return
 	}
-	defer targetConn.Close()
+	defer func() { _ = targetConn.Close() }()
 
 	// Unblock any stalled io.Copy when the context is canceled (e.g. shutdown)
 	// by setting an immediate deadline on both connections. Avoids double-close
@@ -207,8 +207,8 @@ func handleTCPConnection(ctx context.Context, clientConn net.Conn, targetAddr st
 	go func() {
 		<-ctx.Done()
 		now := time.Now()
-		clientConn.SetDeadline(now)
-		targetConn.SetDeadline(now)
+		_ = clientConn.SetDeadline(now)
+		_ = targetConn.SetDeadline(now)
 	}()
 
 	errc := make(chan error, 2)
@@ -216,7 +216,7 @@ func handleTCPConnection(ctx context.Context, clientConn net.Conn, targetAddr st
 	copyData := func(dst, src net.Conn) {
 		_, err := io.Copy(dst, src)
 		if cw, ok := dst.(interface{ CloseWrite() error }); ok {
-			cw.CloseWrite()
+			_ = cw.CloseWrite()
 		}
 		errc <- err
 	}
@@ -268,7 +268,7 @@ func startUDPForwarder(ctx context.Context, wg *sync.WaitGroup, listener net.Pac
 			sessions[clientKey] = sendChan
 
 			go func(conn net.Conn, cAddr net.Addr, key string, ch chan []byte) {
-				defer conn.Close()
+				defer func() { _ = conn.Close() }()
 				defer func() {
 					mu.Lock()
 					// Only delete if the map still points to our channel,
@@ -286,7 +286,7 @@ func startUDPForwarder(ctx context.Context, wg *sync.WaitGroup, listener net.Pac
 					for pkt := range ch {
 						if _, werr := conn.Write(pkt); werr != nil {
 							log.Printf("[%s UDP] Write to target %s error: %v", direction, targetAddr, werr)
-							conn.Close() // unblock the Read below
+							_ = conn.Close() // unblock the Read below
 							return
 						}
 					}
@@ -295,7 +295,7 @@ func startUDPForwarder(ctx context.Context, wg *sync.WaitGroup, listener net.Pac
 				// Forward response packets (targetConn -> client).
 				respBuffer := make([]byte, 65535)
 				for {
-					conn.SetReadDeadline(time.Now().Add(timeout))
+					_ = conn.SetReadDeadline(time.Now().Add(timeout))
 					rn, rerr := conn.Read(respBuffer)
 					if rerr != nil {
 						return // Timeout or connection closed; defers handle cleanup.
