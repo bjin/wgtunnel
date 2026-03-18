@@ -199,16 +199,20 @@ func handleTCPConnection(ctx context.Context, clientConn net.Conn, targetAddr st
 	}
 	defer func() { _ = targetConn.Close() }()
 
-	// Unblock any stalled io.Copy when the context is canceled (e.g. shutdown)
+	// Unblock any stalled io.Copy when the parent context is canceled (e.g. shutdown)
 	// by setting an immediate deadline on both connections. Avoids double-close
 	// since clientConn and targetConn are already closed by their defers above.
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	done := make(chan struct{})
+	defer close(done)
 	go func() {
-		<-ctx.Done()
-		now := time.Now()
-		_ = clientConn.SetDeadline(now)
-		_ = targetConn.SetDeadline(now)
+		select {
+		case <-ctx.Done():
+			now := time.Now()
+			_ = clientConn.SetDeadline(now)
+			_ = targetConn.SetDeadline(now)
+		case <-done:
+			// Normal exit, do not set deadlines on already-closed connections.
+		}
 	}()
 
 	errc := make(chan error, 2)
@@ -233,6 +237,7 @@ func startUDPForwarder(ctx context.Context, wg *sync.WaitGroup, listener net.Pac
 	log.Printf("[%s UDP] Listening on %s, forwarding to %s", direction, listener.LocalAddr(), targetAddr)
 
 	var mu sync.Mutex
+	var writeMu sync.Mutex
 	// sessions maps each client address to a send channel. The goroutine
 	// launched per session owns the net.Conn exclusively; the main loop
 	// never touches the conn directly, eliminating the race between
@@ -268,6 +273,8 @@ func startUDPForwarder(ctx context.Context, wg *sync.WaitGroup, listener net.Pac
 			sessions[clientKey] = sendChan
 
 			go func(conn net.Conn, cAddr net.Addr, key string, ch chan []byte) {
+				done := make(chan struct{})
+				defer close(done)
 				defer func() { _ = conn.Close() }()
 				defer func() {
 					mu.Lock()
@@ -283,10 +290,15 @@ func startUDPForwarder(ctx context.Context, wg *sync.WaitGroup, listener net.Pac
 				// Runs as a separate goroutine so it doesn't block the
 				// response-reading loop below.
 				go func() {
-					for pkt := range ch {
-						if _, werr := conn.Write(pkt); werr != nil {
-							log.Printf("[%s UDP] Write to target %s error: %v", direction, targetAddr, werr)
-							_ = conn.Close() // unblock the Read below
+					for {
+						select {
+						case pkt := <-ch:
+							if _, werr := conn.Write(pkt); werr != nil {
+								log.Printf("[%s UDP] Write to target %s error: %v", direction, targetAddr, werr)
+								_ = conn.Close() // unblock the Read below
+								return
+							}
+						case <-done:
 							return
 						}
 					}
@@ -300,7 +312,10 @@ func startUDPForwarder(ctx context.Context, wg *sync.WaitGroup, listener net.Pac
 					if rerr != nil {
 						return // Timeout or connection closed; defers handle cleanup.
 					}
-					if _, werr := listener.WriteTo(respBuffer[:rn], cAddr); werr != nil {
+					writeMu.Lock()
+					_, werr := listener.WriteTo(respBuffer[:rn], cAddr)
+					writeMu.Unlock()
+					if werr != nil {
 						log.Printf("[%s UDP] WriteTo client %s error: %v", direction, cAddr, werr)
 					}
 				}
@@ -327,7 +342,25 @@ func parseForwards(flags []string, isRemote bool) ([]ForwardConfig, error) {
 	usedPorts := make(map[string]bool)
 
 	for _, f := range flags {
-		parts := strings.Split(f, ":")
+		var parts []string
+		var current strings.Builder
+		inBrackets := false
+		for _, r := range f {
+			if r == '[' {
+				inBrackets = true
+				current.WriteRune(r)
+			} else if r == ']' {
+				inBrackets = false
+				current.WriteRune(r)
+			} else if r == ':' && !inBrackets {
+				parts = append(parts, current.String())
+				current.Reset()
+			} else {
+				current.WriteRune(r)
+			}
+		}
+		parts = append(parts, current.String())
+
 		if len(parts) < 3 {
 			return nil, fmt.Errorf("invalid format '%s'", f)
 		}
@@ -356,13 +389,17 @@ func parseForwards(flags []string, isRemote bool) ([]ForwardConfig, error) {
 			}
 		}
 
-		portKey := proto + ":" + portStr
+		// Remove brackets from IP and dest if present
+		ip = strings.Trim(ip, "[]")
+		dest = strings.Trim(dest, "[]")
+
+		portKey := proto + ":" + ip + ":" + portStr
 		if usedPorts[portKey] {
 			flagType := "-L"
 			if isRemote {
 				flagType = "-R"
 			}
-			return nil, fmt.Errorf("duplicate port '%s' for protocol '%s' found in %s flags", portStr, proto, flagType)
+			return nil, fmt.Errorf("duplicate bind '%s:%s' for protocol '%s' found in %s flags", ip, portStr, proto, flagType)
 		}
 		usedPorts[portKey] = true
 
