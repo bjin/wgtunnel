@@ -6,27 +6,29 @@ services:
       context: .
       network: host
       dockerfile_inline: |
-        FROM golang:1.23 AS builder
-        RUN git clone https://github.com/WireGuard/wireguard-go.git /app
-        WORKDIR /app
-        RUN CGO_ENABLED=0 make
-
         FROM alpine:latest
-        RUN apk add --no-cache iproute2 wireguard-tools socat bash iperf3
+        RUN apk add --no-cache iproute2 wireguard-tools socat bash iperf3 iptables
         
-        COPY --from=builder /app/wireguard-go /usr/bin/wireguard-go
-
         RUN cat <<'EOF' > /entrypoint.sh
         #!/bin/bash
         set -e
-        mkdir -p /etc/wireguard /var/run/wireguard
+        mkdir -p /etc/wireguard
+        
         wg genkey | tee /etc/wireguard/server_priv | wg pubkey > /etc/wireguard/server_pub
         wg genkey | tee /etc/wireguard/client_priv | wg pubkey > /etc/wireguard/client_pub
 
-        wireguard-go wg0
-        wg set wg0 private-key /etc/wireguard/server_priv listen-port 51820 peer "$(cat /etc/wireguard/client_pub)" allowed-ips 10.1.1.2/32
-        ip address add 10.1.1.1/24 dev wg0
-        ip link set wg0 up
+        cat <<WG_CONF > /etc/wireguard/wg0.conf
+        [Interface]
+        PrivateKey = $(cat /etc/wireguard/server_priv)
+        Address = 10.1.1.1/24
+        ListenPort = 51820
+
+        [Peer]
+        PublicKey = $(cat /etc/wireguard/client_pub)
+        AllowedIPs = 10.1.1.2/32
+        WG_CONF
+
+        wg-quick up wg0
 
         echo "ready"
         exec sleep infinity
@@ -36,8 +38,10 @@ services:
         ENTRYPOINT ["/entrypoint.sh"]
     cap_add:
       - NET_ADMIN
-    devices:
-      - /dev/net/tun
+      - SYS_MODULE
+    sysctls:
+      - net.ipv4.ip_forward=1
+      - net.ipv4.conf.all.src_valid_mark=1
     ports:
       - "51820:51820/udp"
     networks:
