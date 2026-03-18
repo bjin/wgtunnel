@@ -182,6 +182,7 @@ func startTCPForwarder(ctx context.Context, wg *sync.WaitGroup, listener net.Lis
 				return
 			default:
 				log.Printf("[%s TCP] Accept error: %v", direction, err)
+				time.Sleep(10 * time.Millisecond)
 				continue
 			}
 		}
@@ -228,98 +229,172 @@ func handleTCPConnection(ctx context.Context, clientConn net.Conn, targetAddr st
 	<-errc
 }
 
+const (
+	maxUDPPacketSize     = 65535
+	udpSendBufferPackets = 1024
+	udpWorkerCount       = 4
+)
+
+type udpPacket struct {
+	data   []byte
+	length int
+}
+
+var udpPacketPool = sync.Pool{
+	New: func() any {
+		return &udpPacket{data: make([]byte, maxUDPPacketSize)}
+	},
+}
+
+type udpSession struct {
+	ch   chan *udpPacket
+	done chan struct{} // Closed when session ends to signal workers
+}
+
 func startUDPForwarder(ctx context.Context, wg *sync.WaitGroup, listener net.PacketConn, targetAddr string, dialer func(string, string) (net.Conn, error), direction string, timeout time.Duration) {
 	defer wg.Done()
 	log.Printf("[%s UDP] Listening on %s, forwarding to %s", direction, listener.LocalAddr(), targetAddr)
 
-	var mu sync.Mutex
-	// sessions maps each client address to a send channel. The goroutine
-	// launched per session owns the net.Conn exclusively; the main loop
-	// never touches the conn directly, eliminating the race between
-	// concurrent writes and the goroutine closing the conn on timeout.
-	sessions := make(map[string]chan []byte)
-	buffer := make([]byte, 65535)
+	var (
+		mu       sync.RWMutex
+		sessions = make(map[string]*udpSession)
+	)
 
-	for {
-		n, clientAddr, err := listener.ReadFrom(buffer)
-		if err != nil {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-				log.Printf("[%s UDP] Read error: %v", direction, err)
-				continue
-			}
-		}
+	workerWg := &sync.WaitGroup{}
+	workerWg.Add(udpWorkerCount)
 
-		clientKey := clientAddr.String()
+	for i := 0; i < udpWorkerCount; i++ {
+		go func() {
+			defer workerWg.Done()
+			buffer := make([]byte, maxUDPPacketSize)
 
-		mu.Lock()
-		sendChan, exists := sessions[clientKey]
-		if !exists {
-			targetConn, dialErr := dialer("udp", targetAddr)
-			if dialErr != nil {
-				log.Printf("[%s UDP] Failed to dial target %s: %v", direction, targetAddr, dialErr)
-				mu.Unlock()
-				continue
-			}
-			// Buffered so the main loop is never blocked by a slow session.
-			sendChan = make(chan []byte, 1024)
-			sessions[clientKey] = sendChan
-
-			go func(conn net.Conn, cAddr net.Addr, key string, ch chan []byte) {
-				defer func() { _ = conn.Close() }()
-				defer func() {
-					mu.Lock()
-					// Only delete if the map still points to our channel,
-					// not a newer session that reused the same key.
-					if sessions[key] == ch {
-						delete(sessions, key)
-					}
-					mu.Unlock()
-				}()
-
-				// Forward inbound packets (main loop -> targetConn).
-				// Runs as a separate goroutine so it doesn't block the
-				// response-reading loop below.
-				go func() {
-					for pkt := range ch {
-						if _, werr := conn.Write(pkt); werr != nil {
-							log.Printf("[%s UDP] Write to target %s error: %v", direction, targetAddr, werr)
-							_ = conn.Close() // unblock the Read below
-							return
-						}
-					}
-				}()
-
-				// Forward response packets (targetConn -> client).
-				respBuffer := make([]byte, 65535)
-				for {
-					_ = conn.SetReadDeadline(time.Now().Add(timeout))
-					rn, rerr := conn.Read(respBuffer)
-					if rerr != nil {
-						return // Timeout or connection closed; defers handle cleanup.
-					}
-					if _, werr := listener.WriteTo(respBuffer[:rn], cAddr); werr != nil {
-						log.Printf("[%s UDP] WriteTo client %s error: %v", direction, cAddr, werr)
+			for {
+				n, clientAddr, err := listener.ReadFrom(buffer)
+				if err != nil {
+					select {
+					case <-ctx.Done():
+						return
+					default:
+						log.Printf("[%s UDP] Read error: %v", direction, err)
+						time.Sleep(10 * time.Millisecond) // Back-off on persistent errors
+						continue
 					}
 				}
-			}(targetConn, clientAddr, clientKey, sendChan)
-		}
-		mu.Unlock()
 
-		// Copy buffer before sending so the next ReadFrom doesn't race with the
-		// goroutine draining the channel.
-		pkt := make([]byte, n)
-		copy(pkt, buffer[:n])
-		// Non-blocking send: drop the packet if the session's buffer is full
-		// rather than stalling the main read loop for all other clients.
-		select {
-		case sendChan <- pkt:
-		default:
-			log.Printf("[%s UDP] Send buffer full for %s, dropping packet", direction, clientKey)
-		}
+				clientKey := clientAddr.String()
+
+				mu.RLock()
+				sess, exists := sessions[clientKey]
+				mu.RUnlock()
+
+				if !exists {
+					mu.Lock()
+					// Double check after acquiring write lock
+					sess, exists = sessions[clientKey]
+					if !exists {
+						sess = &udpSession{
+							ch:   make(chan *udpPacket, udpSendBufferPackets),
+							done: make(chan struct{}),
+						}
+						sessions[clientKey] = sess
+					}
+					mu.Unlock()
+
+					if !exists {
+						targetConn, dialErr := dialer("udp", targetAddr)
+						if dialErr != nil {
+							log.Printf("[%s UDP] Failed to dial target %s: %v", direction, targetAddr, dialErr)
+							mu.Lock()
+							if sessions[clientKey] == sess {
+								delete(sessions, clientKey)
+							}
+							mu.Unlock()
+							close(sess.done)
+							continue
+						}
+
+						go func(conn net.Conn, cAddr net.Addr, key string, s *udpSession) {
+							defer func() {
+								_ = conn.Close()
+								mu.Lock()
+								// Only delete if the map still points to our session
+								if sessions[key] == s {
+									delete(sessions, key)
+								}
+								mu.Unlock()
+								close(s.done) // Signal workers to stop sending
+							}()
+
+							// Forward inbound packets (read loop -> targetConn).
+							go func() {
+								for {
+									select {
+									case pkt := <-s.ch:
+										if _, werr := conn.Write(pkt.data[:pkt.length]); werr != nil {
+											log.Printf("[%s UDP] Write to target %s error: %v", direction, targetAddr, werr)
+											_ = conn.Close() // unblock the Read loop below
+										}
+										udpPacketPool.Put(pkt)
+									case <-s.done:
+										// Session ended, drain any remaining packets back to the pool
+										for {
+											select {
+											case pkt := <-s.ch:
+												udpPacketPool.Put(pkt)
+											default:
+												return
+											}
+										}
+									}
+								}
+							}()
+
+							// Forward response packets (targetConn -> client).
+							respBuffer := make([]byte, maxUDPPacketSize)
+							_ = conn.SetReadDeadline(time.Now().Add(timeout))
+
+							for {
+								rn, rerr := conn.Read(respBuffer)
+								if rerr != nil {
+									return // Timeout or connection closed; defers handle cleanup
+								}
+								// Reset deadline only after a successful read
+								_ = conn.SetReadDeadline(time.Now().Add(timeout))
+
+								if _, werr := listener.WriteTo(respBuffer[:rn], cAddr); werr != nil {
+									log.Printf("[%s UDP] WriteTo client %s error: %v", direction, cAddr, werr)
+									return // Terminate session on write error
+								}
+							}
+						}(targetConn, clientAddr, clientKey, sess)
+					}
+				}
+
+				// Check if session is still alive before sending
+				select {
+				case <-sess.done:
+					// Session just died, drop packet
+				default:
+					pkt := udpPacketPool.Get().(*udpPacket)
+					pkt.length = n
+					copy(pkt.data, buffer[:n])
+
+					// Non-blocking send: drop the packet if the session's buffer is full
+					// or if the session ends while we are trying to send.
+					select {
+					case sess.ch <- pkt:
+					case <-sess.done:
+						udpPacketPool.Put(pkt)
+					default:
+						log.Printf("[%s UDP] Send buffer full for %s, dropping packet", direction, clientKey)
+						udpPacketPool.Put(pkt)
+					}
+				}
+			}
+		}()
 	}
+
+	workerWg.Wait()
 }
 
 func parseForwards(flags []string, isRemote bool) ([]ForwardConfig, error) {
